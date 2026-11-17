@@ -1,64 +1,73 @@
 package plux
 
 import (
+	"errors"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 )
 
 type Connection struct {
-	ID uuid.UUID
-	Conn *net.UDPConn
-	
+	id   uuid.UUID
+	node *Node
+
+	address *net.UDPAddr
+
 	sendSeq uint32
-	recvSeq uint32
+	mu      sync.Mutex
+
+	connected atomic.Bool
+	closing   atomic.Bool
 }
 
-// structure is just uuid
-func (c *Connection) Serialize() ([]byte, error) {
-	rawPacket, err := c.ID.MarshalBinary()
-	if err != nil {
-		return nil, err
+func (c *Connection) ID() uuid.UUID {
+	return c.id
+}
+
+func (c *Connection) Connected() bool {
+	return c.connected.Load()
+}
+
+func (c *Connection) Send(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.connected.Load() {
+		return errors.New("connection isnt established")
 	}
 	
-	return rawPacket, nil
-}
-
-func DeserializeConnection(raw []byte) (*Connection, error) {
-	id, err := uuid.FromBytes(raw)
-	if err != nil {
-		return nil, err
+	if c.closing.Load() {
+		return errors.New("connections closing")
 	}
 
-	return &Connection{ ID: id }, nil
-}
-
-func (c *Connection) SendPacket(packet Packet) error {
-	rawPacket, err := packet.Serialize()
-	if err != nil {
+	p := createPacket(userPacket, c.sendSeq, data)
+	if err := c.node.sendPacket(c, p); err != nil {
 		return err
 	}
 
-	_, err = c.Conn.Write(rawPacket)
-	if err != nil {
+	c.sendSeq++
+	return nil
+}
+
+func (c *Connection) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.connected.Load() {
+		return errors.New("connection is not established")
+	}
+	
+	if !c.closing.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	p := createPacket(killPacket, 0, c.id[:])
+	if err := c.node.sendPacket(c, p); err != nil {
+		c.closing.Store(false)
 		return err
 	}
 
 	return nil
-}
-
-func (c *Connection) ReceivePacket() (*Packet, error) {
-    buf := make([]byte, 65535)
-
-    n, err := c.Conn.Read(buf)
-    if err != nil {
-        return nil, err
-    }
-
-    packet, err := DeserializePacket(buf[:n])
-    if err != nil {
-        return nil, err
-    }
-
-    return packet, nil
 }
