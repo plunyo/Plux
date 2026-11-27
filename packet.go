@@ -19,28 +19,29 @@ const (
 	userPacket
 	killPacket
 	killAckPacket
+	ackPacket
 )
 
-const packetHeaderSize = 7
-
-func createPacket(packetType packetType, seq uint32, payload []byte) *packet {
+func createPacket(kind packetType, sequenceNumber uint32, payload []byte) *packet {
 	return &packet{
-		Type:           packetType,
-		SequenceNumber: seq,
+		Type:           kind,
+		SequenceNumber: sequenceNumber,
 		Payload:        append([]byte(nil), payload...),
 	}
 }
 
-func (p *packet) serialize() ([]byte, error) {
-	if len(p.Payload) > 65535 {
+func (packet *packet) serialize() ([]byte, error) {
+	if len(packet.Payload) > maxPacketPayload {
 		return nil, errors.New("packet payload too large")
 	}
 
-	raw := make([]byte, packetHeaderSize+len(p.Payload))
-	raw[0] = byte(p.Type)
-	binary.LittleEndian.PutUint32(raw[1:5], p.SequenceNumber)
-	binary.LittleEndian.PutUint16(raw[5:7], uint16(len(p.Payload)))
-	copy(raw[packetHeaderSize:], p.Payload)
+	raw := make([]byte, packetHeaderSize+len(packet.Payload))
+	raw[0] = byte(packet.Type)
+
+	binary.BigEndian.PutUint32(raw[1:5], packet.SequenceNumber)
+	binary.BigEndian.PutUint16(raw[5:7], uint16(len(packet.Payload)))
+
+	copy(raw[packetHeaderSize:], packet.Payload)
 
 	return raw, nil
 }
@@ -50,19 +51,21 @@ func deserializePacket(raw []byte) (*packet, error) {
 		return nil, errors.New("packet too short")
 	}
 
-	payloadSize := int(binary.LittleEndian.Uint16(raw[5:7]))
+	payloadSize := int(binary.BigEndian.Uint16(raw[5:7]))
+
 	if len(raw) != packetHeaderSize+payloadSize {
 		return nil, errors.New("invalid packet payload size")
 	}
 
-	packetType := packetType(raw[0])
-	if packetType > killAckPacket {
+	receivedPacketType := packetType(raw[0])
+
+	if receivedPacketType > killAckPacket {
 		return nil, errors.New("unknown packet type")
 	}
 
 	return &packet{
-		Type:           packetType,
-		SequenceNumber: binary.LittleEndian.Uint32(raw[1:5]),
+		Type:           receivedPacketType,
+		SequenceNumber: binary.BigEndian.Uint32(raw[1:5]),
 		Payload:        append([]byte(nil), raw[packetHeaderSize:]...),
 	}, nil
 }

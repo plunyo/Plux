@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -13,23 +14,23 @@ import (
 type Node struct {
 	peers     map[uuid.UUID]*Connection
 	addresses map[string]*Connection
-	conn      *net.UDPConn
+	udpConn   *net.UDPConn
 
 	events chan Event
 	done   chan struct{}
 
-	mu        sync.RWMutex
+	mutex     sync.RWMutex
 	closeOnce sync.Once
 	started   atomic.Bool
 }
 
 func NewNode(address string) (*Node, error) {
-	addr, err := net.ResolveUDPAddr("udp", address)
+	udpAddress, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
+	udpConn, err := net.ListenUDP("udp", udpAddress)
 	if err != nil {
 		return nil, err
 	}
@@ -37,27 +38,28 @@ func NewNode(address string) (*Node, error) {
 	return &Node{
 		peers:     make(map[uuid.UUID]*Connection),
 		addresses: make(map[string]*Connection),
-		conn:      conn,
-		events:    make(chan Event, 64),
+		udpConn:   udpConn,
+		events:    make(chan Event, eventBufferSize),
 		done:      make(chan struct{}),
 	}, nil
 }
 
-func (n *Node) Events() <-chan Event {
-	return n.events
+func (node *Node) Events() <-chan Event {
+	return node.events
 }
 
-func (n *Node) Addr() *net.UDPAddr {
-	addr, _ := n.conn.LocalAddr().(*net.UDPAddr)
-	return addr
+func (node *Node) Addr() *net.UDPAddr {
+	udpAddress, _ := node.udpConn.LocalAddr().(*net.UDPAddr)
+	return udpAddress
 }
 
-func (n *Node) Peers() int {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
+func (node *Node) Peers() int {
+	node.mutex.RLock()
+	defer node.mutex.RUnlock()
 
 	count := 0
-	for _, connection := range n.peers {
+
+	for _, connection := range node.peers {
 		if connection.Connected() {
 			count++
 		}
@@ -66,201 +68,302 @@ func (n *Node) Peers() int {
 	return count
 }
 
-func (n *Node) Connect(address string) (*Connection, error) {
-	addr, err := net.ResolveUDPAddr("udp", address)
+func (node *Node) Connect(address string) (*Connection, error) {
+	udpAddress, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		return nil, err
 	}
 
-	key := addr.String()
+	addressKey := udpAddress.String()
 
-	n.mu.Lock()
-	if existing := n.addresses[key]; existing != nil {
-		n.mu.Unlock()
+	node.mutex.Lock()
+
+	if existing := node.addresses[addressKey]; existing != nil {
+		node.mutex.Unlock()
 		return nil, errors.New("already connected or connection pending")
 	}
 
 	connection := &Connection{
-		id:      uuid.New(),
-		node:    n,
-		address: addr,
+		id:            uuid.New(),
+		node:          node,
+		address:       udpAddress,
+		received:      make(map[uint32]struct{}),
+		pending:       make(map[uint32]*pendingPacket),
 	}
-	n.peers[connection.id] = connection
-	n.addresses[key] = connection
-	n.mu.Unlock()
 
-	p := createPacket(connPacket, 0, connection.id[:])
-	if err := n.sendPacket(connection, p); err != nil {
-		n.removeConnection(connection)
+	node.peers[connection.id] = connection
+	node.addresses[addressKey] = connection
+
+	node.mutex.Unlock()
+
+	packet := createPacket(connPacket, 0, connection.id[:])
+
+	if err := node.sendPacket(connection, packet); err != nil {
+		node.removeConnection(connection)
 		return nil, err
 	}
 
 	return connection, nil
 }
 
-func (n *Node) Serve() error {
-	if !n.started.CompareAndSwap(false, true) {
+func (node *Node) Start() error {
+    go func() {
+        if err := node.Serve(); err != nil {
+            node.emit(Event{
+                Type: ErrorOccurred,
+                Data: []byte(err.Error()),
+            })
+        }
+    }()
+
+    return nil
+}
+
+func (node *Node) Serve() error {
+	if !node.started.CompareAndSwap(false, true) {
 		return errors.New("node is already serving")
 	}
-	defer close(n.events)
 
-	buf := make([]byte, 65535)
+	defer close(node.events)
+
+	go node.retransmissionLoop()
+
+	buffer := make([]byte, 65535)
 
 	for {
-		size, address, err := n.conn.ReadFromUDP(buf)
+		size, udpAddress, err := node.udpConn.ReadFromUDP(buffer)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+
 			return err
 		}
 
-		p, err := deserializePacket(buf[:size])
+		packet, err := deserializePacket(buffer[:size])
 		if err != nil {
 			continue
 		}
 
-		if err := n.handlePacket(address, p); err != nil {
+		if err := node.handlePacket(udpAddress, packet); err != nil {
 			return fmt.Errorf("handling packet: %w", err)
 		}
 	}
 }
 
-func (n *Node) Close() error {
+func (node *Node) Close() error {
 	var err error
-	n.closeOnce.Do(func() {
-		close(n.done)
-		err = n.conn.Close()
+
+	node.closeOnce.Do(func() {
+		close(node.done)
+		err = node.udpConn.Close()
 	})
+
 	return err
 }
 
-func (n *Node) handlePacket(address *net.UDPAddr, p *packet) error {
-	key := address.String()
+func (node *Node) handlePacket(udpAddress *net.UDPAddr, packet *packet) error {
+	addressKey := udpAddress.String()
 
-	switch p.Type {
+	switch packet.Type {
 	case connPacket:
-		id, err := uuid.FromBytes(p.Payload)
+		connectionID, err := uuid.FromBytes(packet.Payload)
 		if err != nil {
 			return nil
 		}
 
-		n.mu.Lock()
-		connection := n.addresses[key]
+		node.mutex.Lock()
+
+		connection := node.addresses[addressKey]
+
 		if connection == nil {
 			connection = &Connection{
-				id:      id,
-				node:    n,
-				address: address,
+				id:       connectionID,
+				node:     node,
+				address:  udpAddress,
+				received: make(map[uint32]struct{}),
+				pending:  make(map[uint32]*pendingPacket),
 			}
-			n.peers[id] = connection
-			n.addresses[key] = connection
-		}
-		n.mu.Unlock()
 
-		ack := createPacket(connAckPacket, 0, id[:])
-		if err := n.sendPacket(connection, ack); err != nil {
+			node.peers[connectionID] = connection
+			node.addresses[addressKey] = connection
+		}
+
+		node.mutex.Unlock()
+
+		acknowledgement := createPacket(connAckPacket, 0, connectionID[:])
+
+		if err := node.sendPacket(connection, acknowledgement); err != nil {
 			return err
 		}
 
 		if connection.connected.CompareAndSwap(false, true) {
-			n.emit(Event{Type: PeerConnected, Connection: connection})
+			node.emit(Event{
+				Type:       PeerConnected,
+				Connection: connection,
+			})
 		}
 
 	case connAckPacket:
-		id, err := uuid.FromBytes(p.Payload)
+		connectionID, err := uuid.FromBytes(packet.Payload)
 		if err != nil {
 			return nil
 		}
 
-		n.mu.RLock()
-		connection := n.addresses[key]
-		n.mu.RUnlock()
-		if connection == nil || connection.id != id {
+		node.mutex.RLock()
+		connection := node.addresses[addressKey]
+		node.mutex.RUnlock()
+
+		if connection == nil || connection.id != connectionID {
 			return nil
 		}
 
 		if connection.connected.CompareAndSwap(false, true) {
-			n.emit(Event{Type: PeerConnected, Connection: connection})
+			node.emit(Event{
+				Type:       PeerConnected,
+				Connection: connection,
+			})
 		}
 
 	case userPacket:
-		n.mu.RLock()
-		connection := n.addresses[key]
-		n.mu.RUnlock()
+		node.mutex.RLock()
+		connection := node.addresses[addressKey]
+		node.mutex.RUnlock()
+
 		if connection == nil || !connection.connected.Load() || connection.closing.Load() {
 			return nil
 		}
 
-		n.emit(Event{
-			Type:       MessageReceived,
-			Connection: connection,
-			Data:       append([]byte(nil), p.Payload...),
-		})
+		acknowledgement := createPacket(ackPacket, packet.SequenceNumber, nil)
 
-	case killPacket:
-		id, err := uuid.FromBytes(p.Payload)
-		if err != nil {
-			return nil
-		}
-
-		n.mu.RLock()
-		connection := n.addresses[key]
-		n.mu.RUnlock()
-		if connection == nil || connection.id != id {
-			return nil
-		}
-
-		ack := createPacket(killAckPacket, 0, id[:])
-		if err := n.sendPacket(connection, ack); err != nil {
+		if err := node.sendPacket(connection, acknowledgement); err != nil {
 			return err
 		}
 
-		n.removeConnection(connection)
-		connection.connected.Store(false)
-		n.emit(Event{Type: PeerDisconnected, Connection: connection})
+		if !connection.markReceived(packet.SequenceNumber) {
+			return nil
+		}
 
-	case killAckPacket:
-		id, err := uuid.FromBytes(p.Payload)
+		node.emit(Event{
+			Type:       MessageReceived,
+			Connection: connection,
+			Data:       append([]byte(nil), packet.Payload...),
+		})
+
+	case ackPacket:
+		node.mutex.RLock()
+		connection := node.addresses[addressKey]
+		node.mutex.RUnlock()
+
+		if connection == nil {
+			return nil
+		}
+
+		connection.pendingMutex.Lock()
+		delete(connection.pending, packet.SequenceNumber)
+		connection.pendingMutex.Unlock()
+
+	case killPacket:
+		connectionID, err := uuid.FromBytes(packet.Payload)
 		if err != nil {
 			return nil
 		}
 
-		n.mu.RLock()
-		connection := n.addresses[key]
-		n.mu.RUnlock()
-		if connection == nil || connection.id != id {
+		node.mutex.RLock()
+		connection := node.addresses[addressKey]
+		node.mutex.RUnlock()
+
+		if connection == nil || connection.id != connectionID {
 			return nil
 		}
 
-		n.removeConnection(connection)
+		acknowledgement := createPacket(killAckPacket, 0, connectionID[:])
+
+		if err := node.sendPacket(connection, acknowledgement); err != nil {
+			return err
+		}
+
+		node.removeConnection(connection)
 		connection.connected.Store(false)
-		n.emit(Event{Type: PeerDisconnected, Connection: connection})
+
+		node.emit(Event{
+			Type:       PeerDisconnected,
+			Connection: connection,
+		})
+
+	case killAckPacket:
+		connectionID, err := uuid.FromBytes(packet.Payload)
+		if err != nil {
+			return nil
+		}
+
+		node.mutex.RLock()
+		connection := node.addresses[addressKey]
+		node.mutex.RUnlock()
+
+		if connection == nil || connection.id != connectionID {
+			return nil
+		}
+
+		node.removeConnection(connection)
+		connection.connected.Store(false)
+
+		node.emit(Event{
+			Type:       PeerDisconnected,
+			Connection: connection,
+		})
 	}
 
 	return nil
 }
 
-func (n *Node) sendPacket(connection *Connection, p *packet) error {
-	raw, err := p.serialize()
+func (node *Node) sendPacket(connection *Connection, packet *packet) error {
+	raw, err := packet.serialize()
 	if err != nil {
 		return err
 	}
 
-	_, err = n.conn.WriteToUDP(raw, connection.address)
+	_, err = node.udpConn.WriteToUDP(raw, connection.address)
 	return err
 }
 
-func (n *Node) removeConnection(connection *Connection) {
-	n.mu.Lock()
-	delete(n.peers, connection.id)
-	delete(n.addresses, connection.address.String())
-	n.mu.Unlock()
+func (node *Node) removeConnection(connection *Connection) {
+	node.mutex.Lock()
+	delete(node.peers, connection.id)
+	delete(node.addresses, connection.address.String())
+	node.mutex.Unlock()
 }
 
-func (n *Node) emit(event Event) {
+func (node *Node) emit(event Event) {
 	select {
-	case n.events <- event:
-	case <-n.done:
+	case node.events <- event:
+	case <-node.done:
+	}
+}
+
+func (node *Node) retransmissionLoop() {
+	ticker := time.NewTicker(retransmissionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			node.mutex.RLock()
+
+			connections := make([]*Connection, 0, len(node.peers))
+
+			for _, connection := range node.peers {
+				connections = append(connections, connection)
+			}
+
+			node.mutex.RUnlock()
+
+			for _, connection := range connections {
+				connection.checkPending()
+			}
+
+		case <-node.done:
+			return
+		}
 	}
 }

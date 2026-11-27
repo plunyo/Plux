@@ -6,6 +6,7 @@ const (
 	PeerConnected EventType = iota
 	PeerDisconnected
 	MessageReceived
+	ErrorOccurred
 )
 
 type Event struct {
